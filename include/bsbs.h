@@ -63,6 +63,8 @@ void *bsbs_alloc_save(void);
 
 void bsbs_alloc_load(void *save);
 
+char *bsbs_alloc_print(char const *format, ...);
+
 bsbs_run *bsbs_run_create(void);
 
 void bsbs_run_add_arg(bsbs_run *run, char const *arg);
@@ -78,6 +80,8 @@ void bsbs_run_add_output_file_arg(bsbs_run *run, char const *filepath);
 void bsbs_run_execute(bsbs_run const *run);
 
 void bsbs_generate(char const *filepath, void *userdata, bsbs_genfn callback);
+
+void bsbs_mkpath(char const *filename);
 
 #define bsbs_alloc(type, count) \
   (type*)bsbs_alloc_aligned_array(sizeof(type), alignof(type), (count))
@@ -107,7 +111,7 @@ static void *_bsbs_alloc_ptr;
 
 typedef struct _bsbs_list_node {
   struct _bsbs_list_node *next;
-  char content[];
+  char const *content;
 } _bsbs_list_node;
 
 typedef struct _bsbs_list {
@@ -123,12 +127,9 @@ struct bsbs_run {
 };
 
 static void _bsbs_list_append(_bsbs_list *list, char const *content) {
-  size_t length = strlen(content);
-  bsbs_alloc(char, length + 1);
-
   _bsbs_list_node *node = bsbs_alloc(_bsbs_list_node, 1);
   node->next = NULL;
-  strcpy(node->content, content);
+  node->content = content;
 
   if (list->head == NULL) {
     list->head = node;
@@ -142,8 +143,8 @@ static void _bsbs_list_append(_bsbs_list *list, char const *content) {
 }
 
 // Convert a list to a null terminated array of strings.
-static char **_bsbs_list_to_ntarray(_bsbs_list const *list) {
-  char **array = bsbs_alloc(char*, list->count + 1);
+static char const **_bsbs_list_to_ntarray(_bsbs_list const *list) {
+  char const **array = bsbs_alloc(char const*, list->count + 1);
 
   size_t i = 0;
   _bsbs_list_node *n = list->head;
@@ -202,18 +203,52 @@ static bool _bsbs_requires_rebuild(_bsbs_list const *inputs, _bsbs_list const *o
   return false;
 }
 
-static void _bsbs_run_execute_unchecked(bsbs_run const *run) {
-  char **args = _bsbs_list_to_ntarray(&run->args);
+static void _bsbs_print_command(bsbs_run const *run) {
+  for (_bsbs_list_node *n = run->args.head; n; n = n->next) {
+    size_t len = strlen(n->content);
+    for (size_t i = 0; i < len; i++) {
+      char c = n->content[i];
+      switch (c) {
+      case '`': case '~': case '"': case '!': case '#': case '$': case '&':
+      case '*': case '(': case ')': case '{': case '[': case '|': case '\\':
+      case ';': case '<': case '>': case '?': case ' ': case '\t': case '\'':
+        putc('\\', stdout);
+        putc(c, stdout);
+        break;
+        
+      default:
+        putc(c, stdout);
+        break;
+      }
+    }
 
+    if (n->next) putc(' ', stdout);
+  }
+
+  putc('\n', stdout);
+  fflush(stdout);
+}
+
+static void _bsbs_run_execute_unchecked(bsbs_run const *run) {
+  _bsbs_print_command(run);
+
+  char const **args = _bsbs_list_to_ntarray(&run->args);
+
+  // Create directories for the outputs.
+  for (_bsbs_list_node *n = run->outputs.head; n; n = n->next) {
+    bsbs_mkpath(n->content);
+  }
+
+  // Run the command.
   int pid = fork();
   if (pid == 0) {
-    // Child proces
-    execvp(args[0], args); // noreturn if successful
+    execvp(args[0], (char**)args); // noreturn if successful
     bsbs_die("exec failed: %s\n", strerror(errno));
   } else if (pid < 0) {
     bsbs_die("fork failed: %s\n", strerror(errno));
   }
 
+  // Wait for the process to finish
   int status;
   if (waitpid(pid, &status, 0) < 0) {
     bsbs_die("wait on '%s' failed: %s\n", args[0], strerror(errno));
@@ -226,7 +261,7 @@ void bsbs_init(size_t total_memory, char const* arg0, char const* file) {
   // Set up the global arena allocator.
   _bsbs_alloc_base = malloc(total_memory);
   if (!_bsbs_alloc_base) bsbs_die("malloc failed\n");
-  _bsbs_alloc_ptr = _bsbs_alloc_base + total_memory;
+  _bsbs_alloc_ptr = (void*)((uintptr_t)_bsbs_alloc_base + total_memory);
 
   // Get the C compiler name.
   char const *cc = getenv("CC");
@@ -259,21 +294,23 @@ noreturn void bsbs_die(char const *format, ...) {
 }
 
 void *bsbs_alloc_aligned_array(size_t size, size_t align, size_t count) {
-  size_t mask = align - 1;
+  uintptr_t mask = align - 1;
   assert((align & mask) == 0 && align != 0);
   assert((size & mask) == 0 && size != 0);
 
   uintptr_t ptr = (uintptr_t)_bsbs_alloc_ptr;
-  ptr &= ~((uintptr_t)mask);
-
   uintptr_t nbytes = size * count;
+
   if (nbytes / size != count) {
     bsbs_die("overflow (%zu * %zu)\n", size, count);
   } else if (nbytes > ptr) {
     bsbs_die("underflow (%zu - %zu)\n", ptr, nbytes);
   }
 
-  _bsbs_alloc_ptr = (void*)(ptr - nbytes);
+  ptr -= nbytes;
+  ptr &= ~mask;
+
+  _bsbs_alloc_ptr = (void*)ptr;
   if (_bsbs_alloc_ptr < _bsbs_alloc_base) {
     bsbs_die("out of memory\n");
   }
@@ -291,8 +328,27 @@ void bsbs_alloc_load(void *save) {
   _bsbs_alloc_ptr = save;
 }
 
+char *bsbs_alloc_print(char const *format, ...) {
+  va_list ap0, ap1;
+  va_start(ap0, format);
+  va_copy(ap1, ap0);
+
+  int length = vsnprintf(NULL, 0, format, ap0);
+  if (length < 0) bsbs_die("invalid format '%s'\n", format);
+
+  char *string = bsbs_alloc(char, length + 1);
+  vsnprintf(string, length + 1, format, ap1);
+
+  va_end(ap0);
+  va_end(ap1);
+
+  return string;
+}
+
 bsbs_run *bsbs_run_create(void) {
-  return bsbs_alloc(bsbs_run, 1);
+  bsbs_run *run = bsbs_alloc(bsbs_run, 1);
+  memset(run, 0, sizeof(bsbs_run));
+  return run;
 }
 
 void bsbs_run_add_arg(bsbs_run *run, char const *arg) {
@@ -338,6 +394,27 @@ void bsbs_generate(char const *filepath, void *userdata, bsbs_genfn callback) {
   callback(userdata, fp);
   fflush(fp);
   fclose(fp);
+}
+
+void bsbs_mkpath(char const *filename) {
+  void *save = bsbs_alloc_save();
+
+  // Duplicate the filename
+  char *p = bsbs_alloc_print("%s", filename);
+  char *sep = strchr(p + 1, '/');
+
+  while (sep != NULL) {
+    *sep = '\0';
+
+    if (mkdirat(AT_FDCWD, p, 0755) < 0 && errno != EEXIST) {
+      bsbs_die("failed to make path '%s': %s\n", p, strerror(errno));
+    }
+    
+    *sep = '/';
+    sep = strchr(sep + 1, '/');
+  }
+
+  bsbs_alloc_load(save);
 }
 
 #endif // BSBS_IMPL
