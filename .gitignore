@@ -1,0 +1,3 @@
+# User specific config files
+.helix/
+.clangd

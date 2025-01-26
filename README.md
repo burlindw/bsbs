@@ -14,6 +14,15 @@ Copy the `include/bsbs.h` file into your project at a location of your chose.
 Create a C source file in the root of your project. By convention, this should
 be called `bootstrap.c`, but the name isn't important to the use of BSBS.
 
+Include the `bsbs.h` file in the source file. Be sure to define a `BSBS_IMPL`
+macro before the include directive. Do not define `BSBS_IMPL` in any other
+compilation units.
+
+```c
+#define BSBS_IMPL
+#include "vendor/bsbs/include/bsbs.h"
+```
+
 Call `bsbs_init()` at the beginning of the main function and create the commands
 or generated files needed to build the project. See the `examples` directory for
 examples of how this is used.
